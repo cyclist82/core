@@ -5,12 +5,8 @@ import asyncio
 
 import async_timeout
 from matter_server.client import MatterClient
-from matter_server.client.exceptions import (
-    CannotConnect,
-    FailedCommand,
-    InvalidServerVersion,
-)
-from matter_server.common.models.error import MatterError
+from matter_server.client.exceptions import CannotConnect, InvalidServerVersion
+from matter_server.common.errors import MatterError, NodeCommissionFailed
 import voluptuous as vol
 
 from homeassistant.components.hassio import AddonError, AddonManager, AddonState
@@ -32,7 +28,7 @@ from .addon import get_addon_manager
 from .api import async_register_api
 from .const import CONF_INTEGRATION_CREATED_ADDON, CONF_USE_ADDON, DOMAIN, LOGGER
 from .device_platform import DEVICE_PLATFORM
-from .helpers import MatterEntryData, get_matter
+from .helpers import MatterEntryData, get_matter, get_node_from_device_entry
 
 CONNECT_TIMEOUT = 10
 LISTEN_READY_TIMEOUT = 30
@@ -192,23 +188,13 @@ async def async_remove_config_entry_device(
     hass: HomeAssistant, config_entry: ConfigEntry, device_entry: dr.DeviceEntry
 ) -> bool:
     """Remove a config entry from a device."""
-    unique_id = None
+    node = await get_node_from_device_entry(hass, device_entry)
 
-    for ident in device_entry.identifiers:
-        if ident[0] == DOMAIN:
-            unique_id = ident[1]
-            break
-
-    if not unique_id:
+    if node is None:
         return True
 
-    matter_entry_data: MatterEntryData = hass.data[DOMAIN][config_entry.entry_id]
-    matter_client = matter_entry_data.adapter.matter_client
-
-    for node in await matter_client.get_nodes():
-        if node.unique_id == unique_id:
-            await matter_client.remove_node(node.node_id)
-            break
+    matter = get_matter(hass)
+    await matter.matter_client.remove_node(node.node_id)
 
     return True
 
@@ -221,31 +207,10 @@ def _async_init_services(hass: HomeAssistant) -> None:
         """Get node id from ha device id."""
         dev_reg = dr.async_get(hass)
         device = dev_reg.async_get(ha_device_id)
-
         if device is None:
             return None
-
-        matter_id = next(
-            (
-                identifier
-                for identifier in device.identifiers
-                if identifier[0] == DOMAIN
-            ),
-            None,
-        )
-
-        if not matter_id:
-            return None
-
-        unique_id = matter_id[1]
-
-        matter_client = get_matter(hass).matter_client
-
-        # This could be more efficient
-        for node in await matter_client.get_nodes():
-            if node.unique_id == unique_id:
-                return node.node_id
-
+        if node := await get_node_from_device_entry(hass, device):
+            return node.node_id
         return None
 
     async def open_commissioning_window(call: ServiceCall) -> None:
@@ -261,7 +226,7 @@ def _async_init_services(hass: HomeAssistant) -> None:
 
         try:
             await matter_client.open_commissioning_window(node_id)
-        except FailedCommand as err:
+        except NodeCommissionFailed as err:
             raise HomeAssistantError(str(err)) from err
 
     async_register_admin_service(
